@@ -6,8 +6,10 @@
  * 
  */
 
+#include <cstdio>
 #include <string>
 #include <sstream>
+#include <unordered_map>
 #include <fcgiapp.h>
 #include <cgicc/Cgicc.h>
 
@@ -18,15 +20,22 @@
 #include <cgicc/HTTPStatusHeader.h>
 
 #include <gdal_priv.h>
+#include <gdal_utils.h>
 
 using namespace std;
 using namespace cgicc;
 
-// Minimal CGIInput adapter class, for use with libfcgi
-// need to define read() and getenv()
-class myCgiI : public CgiInput {
+// A wrapper around a string, to carry a GDAL visfilename
+struct vsifname {
+    vsifname(const char *filename) : name(filename) {};
+    CPLString name;
+};
+
+// CGIInput adapter class, for use with libfcgi
+// need to define read() and getenv() to keep libcgicc happy
+class state : public CgiInput {
 public:
-    myCgiI(FCGX_Request *request) : req(request) {}
+    state(FCGX_Request *request) : verbose(false), req(request) {}
 
     size_t read(char *data, size_t len) override {
         if (!req) return 0;
@@ -38,9 +47,46 @@ public:
         return string(CSLFetchNameValueDef(req->envp, varName, ""));
     }
 
+    int send(const void *data, size_t len) {
+        if (req && req->out)
+            return FCGX_PutStr(reinterpret_cast<const char *>(data), len, req->out);
+        else
+            return fwrite(data, 1, len, stdout);
+    }
+
+    // Send a response as a string. Can be called once or multiple times per request
+    int send(const string &response) {
+        return send(response.c_str(), response.size());
+    }
+
+    // Send the content of a vector, usually byte
+    template<typename T> int send(const vector<T> & response) {
+        return send(response.data(), response.size() * sizeof(T));
+    }
+
+    // Send the content of a file, using VSI, return -1 for errors
+    int send(const vsifname &fname) {
+        VSIStatBufL statb;
+        if (VSIStatL(fname.name, &statb) || statb.st_size == 0 || statb.st_size > 1024 * 1024 * 10)
+            return -1;
+        auto ofile = VSIFOpenL(fname.name, "rb");
+        if (nullptr == ofile)
+            return -1;
+        vector<char> buffer(statb.st_size);
+        VSIFReadL(buffer.data(), 1, statb.st_size, ofile);
+        VSIFCloseL(ofile);
+        return send(buffer);
+    }
+
+    bool verbose;
+    // The fastcgi request object
     FCGX_Request *req;
+    // Helper for CGI input
     Cgicc *cgi;
+    // Input configuration file, line by line
     char **conf;
+    // GDAL pre-open dataset
+    GDALDataset *pds;
 };
 
 // int usage(int argc, char **argv) {
@@ -49,47 +95,32 @@ public:
 //     return 1;
 // }
 
-// Send a response as a string. Can be called once or multiple times per request
-int send(myCgiI &c, const string &response) {
-    if (c.req && c.req->out) {
-        FCGX_PutStr(response.c_str(), response.size(), c.req->out);
-    }
-    else {
-        cout << response;
-    }
-}
+const unordered_map<int, const char *> html_errors = {
+    { 404 , "Not Found"},
+};
 
-// Send the content of a vector, usually byte
-template<typename T> int send(myCgiI &c, const vector<T> & response) {
-    if (c.req && c.req->out) {
-        FCGX_PutStr(reinterpret_cast<const char *>(response.data()), 
-        response.size() * sizeof(T), c.req->out);
-    }
-    else {
-        for (auto &v : response)
-            cout << v;
-    }
-}
-
-int ret_error(myCgiI &c, const string &message, int code = 404) {
+int ret_error(state &c, const string &message, int code = 404) {
     ostringstream os;    
 
     // With cgicc, only the Status line can be sent, which means no other headers work is raw text
     // os << HTTPStatusHeader(code, message);
-    
-    os << "Status: " << code << " " << message << endl;
+
+    // Map to 404 if an invalid code is passed    
+    if (html_errors.find(code) != html_errors.end())
+        code = 404;
+
+    os << "Status: " << code << " " << html_errors.at(code) << endl;
     os << "Content-type: text/html" << endl;
     os << endl;
 
-    // Now we can use tags from cgicc
-    os << html() << h1() << "Invalid request" << br() << html() << endl;
-    // os << "Invalid request" << endl;
+    // can use tags from cgicc html
+    os << html() << h1() << message  << h1() << br() << html() << endl;
 
-    send(c, os.str());
+    c.send(os.str());
     return 0;
 }
 
-int get_image(myCgiI &c) {
+int get_missing(state &c) {
     auto conf = c.conf;
     auto request = c.req;
     auto &cgi = *c.cgi;
@@ -109,15 +140,112 @@ int get_image(myCgiI &c) {
     os << "Status: 200 OK\r\n";
     os << "Content-type: image/jpeg\r\n";
     os << "\r\n";
-    send(c, os.str());
-    send(c, buffer);
+    c.send(os.str());
+    c.send(buffer);
 
     return 0;
 }
 
-int html_out(myCgiI &mcgi, const string & extra) {
-    auto request = mcgi.req;
-    auto &cgi = *mcgi.cgi;
+int parse_bbox(const char *bbval, double *bbox) {
+    int i = 0;
+    char *bb;
+    errno = 0;
+    *bbox++ = CPLStrtod(bbval, &bb);
+    if (errno)
+        return 0;
+    i++;
+    do {
+        if (*bb == ',') bb++;
+        *bbox++ = CPLStrtod(bb, &bb);
+        if (errno)
+            return i;
+        i++;
+    } while (i < 4 && *bbval);
+    return i;
+}
+
+int get_image(state &c) {
+    ostringstream os;    
+    auto conf = c.conf;
+    auto request = c.req;
+    auto &cgi = *c.cgi;
+
+    // Default sizes
+    int xsz = 1024;
+    int ysz = 1024;
+
+    // Start accumulating the text
+    if (c.verbose) {
+        os << "Status: 200 OK\r\n";
+        os << "Content-type: text/html\r\n";
+        os << "\r\n";
+    }
+
+    if (cgi("size").empty())
+        return ret_error(c, "Missing size parameter");
+    if (2 != sscanf(cgi("size").c_str(), "%u,%u", &xsz, &ysz))
+        return ret_error(c, "Can't parse size");
+
+    // Limit the size
+    if (xsz > 2048 || ysz > 2048)
+        xsz = ysz = 1024;
+
+    double bbox[4] = { -180, -90, 180, 90 };
+    if (!cgi("bbox").empty())
+        if (4 != parse_bbox(cgi("bbox").c_str(), bbox))
+            return ret_error(c, "Can't parse bbox");
+    
+    if (c.verbose) {
+        os << "Bounding Box" <<
+         bbox[0] << "," <<
+         bbox[1] << "," <<
+         bbox[2] << "," <<
+         bbox[3] << "," <<
+         br() << "\r\n";
+    }
+
+    // Like vargs
+    char **targs = nullptr;
+    targs = CSLAddString(targs, "-of");
+    targs = CSLAddString(targs, "JPEG");
+    targs = CSLAddString(targs, "-outsize");
+    targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+    targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+    targs = CSLAddString(targs, "-projwin");
+    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3]));
+    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2]));
+    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
+    targs = CSLAddString(targs, "0");
+
+    auto topt = GDALTranslateOptionsNew(targs, nullptr );
+    CPLFree(targs);
+    int errv;
+    const char outfname[] = "/vsimem/out.jpg";
+    auto ods = GDALTranslate(outfname, c.pds, topt, &errv);
+    GDALClose(ods); // Force flush
+    GDALTranslateOptionsFree(topt);
+
+    if (c.verbose) {
+        c.send(os.str());
+    }
+    else {
+        os << "Status: 200 OK\r\n";
+        os << "Content-type: image/jpeg\r\n";
+        os << "\r\n";
+        c.send(os.str());
+        c.send(vsifname(outfname));
+    }
+
+    VSIUnlink(outfname);
+    // This is not strictly required, it will keep getting overwritten
+    VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+    return 0;
+}
+
+int html_out(state &c, const string & extra) {
+    auto request = c.req;
+    auto &cgi = *c.cgi;
     // output string, as stream
     ostringstream os;
 
@@ -161,11 +289,7 @@ int html_out(myCgiI &mcgi, const string & extra) {
     if (!extra.empty())
         os << "Extra " << extra << br() << endl;
 
-    if (request) {
-        FCGX_PutStr(os.str().c_str(), os.str().size(), request->out);
-    } else {
-        cout << os.str();
-    }
+    c.send(os.str());
 
     return 0;
 }
@@ -191,25 +315,27 @@ int main(int argc, char **argv, char **env) {
 
     auto is_fcgi = (FCGX_Accept_r(&request) >= 0);
     // Gets executed only once in CGI mode
-    myCgiI c(is_fcgi ? &request : nullptr);
+    state c(is_fcgi ? &request : nullptr);
     c.conf = conf;
+    c.pds = pds;
     do {
         // Per request
         Cgicc cgi(is_fcgi ? &c : nullptr);
         c.cgi = &cgi;
 
         vector<FormEntry> res;
-        if (cgi.getElement("dbg", res))
-            html_out(c, CPLOPrintf("%x %s", pds, CPLGetLastErrorMsg() ));
-        else
-            get_image(c);
-
+        c.verbose = cgi.getElement("dbg", res);
+        // if (c.verbose)
+        //     html_out(c, CPLOPrintf("%x %s", pds, CPLGetLastErrorMsg() ));
+        // else
+        get_image(c);
         if (is_fcgi)
             FCGX_Finish_r(&request);
 
     } while (is_fcgi && FCGX_Accept_r(&request) == 0);
 
-    delete pds;
+    // Prefered over delete
+    GDALClose(GDALDataset::ToHandle(pds));
     CPLFree(conf);
     GDALDestroy();
    return 0;
