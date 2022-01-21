@@ -36,6 +36,34 @@ struct Dynconf {
     string suffix;
 };
 
+// A GDAL dataset, preopened if pds is not nullptr
+struct gdataset {
+    gdataset() : pds(nullptr), type(0) {};
+    bool open(const string &fname) {
+        if (fname == name) {
+            cerr << "Same file\n";
+            return pds != nullptr;
+        }
+        clear();
+        name = fname;
+        pds = GDALDataset::Open(fname.c_str(), GA_ReadOnly);
+        return pds != nullptr;
+    }
+
+    void clear() {
+        if (pds) {
+            // Prefered over delete
+            GDALClose(GDALDataset::ToHandle(pds));
+            pds = nullptr;
+            name.clear();
+        }
+    }
+
+    GDALDataset *pds;
+    string name;
+    int type;
+};
+
 // CGIInput adapter class, for use with libfcgi
 // need to define read() and getenv() to keep libcgicc happy
 class State : public CgiInput {
@@ -43,9 +71,7 @@ public:
     State(FCGX_Request *request = nullptr) : verbose(false), req(request) {}
 
     ~State() {
-        // Prefered over delete
-        if (pds)
-            GDALClose(GDALDataset::ToHandle(pds));
+        dataset.clear();
         if (conf)
             CSLDestroy(conf);
     }
@@ -101,24 +127,26 @@ public:
     // Input configuration file, line by line
     char **conf;
     // GDAL pre-open dataset
-    GDALDataset *pds;
+    gdataset dataset;
+    // string prefix and suffix if ID is expected
     Dynconf dynconf;
 };
 
 // Maybe this should be a JSON file?
 bool State::configure(char **config) {
     conf = config;
-    string fname = CSLFetchNameValueDef(conf, "Filename", "");
-    if (!fname.empty()) {
+    if (strlen(CSLFetchNameValueDef(conf, "Filename", ""))) {
         // The input dataset, any error gets set to stderr
-        pds = GDALDataset::Open(fname.c_str(), GA_ReadOnly);
-        if (!pds) {
-            cerr << "Can't open file named \"" << (*cgi)("Filename") << '"' << endl;
+        if (!dataset.open(CSLFetchNameValueDef(conf, "Filename", ""))) {
+            cerr << "Can't open file named \"" << dataset.name << '"' << endl;
             return false; // Failure to open
         }
+        return true;
     } else { // Assume dynamic
+        dataset.type = 1;
         dynconf.prefix = CSLFetchNameValueDef(conf, "DPrefix", "");
         dynconf.suffix = CSLFetchNameValueDef(conf, "DSuffix", "");
+        return true;
     }
 
     return false;
@@ -131,17 +159,18 @@ bool State::configure(char **config) {
 // }
 
 const unordered_map<int, const char *> html_errors = {
-    { 404 , "Not Found"},
+    {400, "Bad Request"},
+    {404 , "Not Found"}, 
+    {500 , "Internal Server error"}, 
 };
 
 static int ret_error(State &c, const string &message, int code = 404) {
     ostringstream os;
-
     // With cgicc, only the Status line can be sent, which means no other headers work is raw text
     // os << HTTPStatusHeader(code, message);
 
     // Map to 404 if an invalid code is passed    
-    if (html_errors.find(code) != html_errors.end())
+    if (html_errors.find(code) == html_errors.end())
         code = 404;
 
     os << "Status: " << code << " " << html_errors.at(code) << endl;
@@ -149,7 +178,10 @@ static int ret_error(State &c, const string &message, int code = 404) {
     os << endl;
 
     // can use tags from cgicc html
-    os << html() << h1() << message  << h1() << br() << html() << endl;
+    os << html()
+        << h1() << html_errors.at(code) << h1() << br() 
+        << message  << br() 
+        << html() << endl;
 
     c.send(os.str());
     return 0;
@@ -239,46 +271,96 @@ int get_image(State &c) {
          br() << "\r\n";
     }
 
-    // Like vargs
-    char **targs = nullptr;
-    targs = CSLAddString(targs, "-of");
-    targs = CSLAddString(targs, "JPEG");
-    targs = CSLAddString(targs, "-outsize");
-    targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
-    targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
-    targs = CSLAddString(targs, "-projwin");
-    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
-    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3]));
-    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2]));
-    targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
-    targs = CSLAddString(targs, "0");
+    if (!c.dataset.type) {
+        // Like vargs
+        char **targs = nullptr;
+        targs = CSLAddString(targs, "-of");
+        targs = CSLAddString(targs, "JPEG");
+        targs = CSLAddString(targs, "-outsize");
+        targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+        targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+        targs = CSLAddString(targs, "-projwin");
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
+        targs = CSLAddString(targs, "0");
 
-    auto topt = GDALTranslateOptionsNew(targs, nullptr );
-    CPLFree(targs);
-    int errv;
-    const char outfname[] = "/vsimem/out.jpg";
-    auto ods = GDALTranslate(outfname, c.pds, topt, &errv);
-    GDALClose(ods); // Force flush
-    GDALTranslateOptionsFree(topt);
+        auto topt = GDALTranslateOptionsNew(targs, nullptr );
+        CPLFree(targs);
+        int errv;
+        const char outfname[] = "/vsimem/out.jpg";
+        auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
+        GDALClose(ods); // Force flush
+        GDALTranslateOptionsFree(topt);
 
-    if (c.verbose) {
-        c.send(os.str());
-    }
-    else {
-        // Pass the "RAW" parameter to output raw image
-        if (cgi("RAW").empty()) {
-            fprintf(stderr,"Header\n");
-            os << "Status: 200 OK\r\n";
-            os << "Content-type: image/jpeg\r\n";
-            os << "\r\n";
+        if (c.verbose) {
             c.send(os.str());
         }
-        c.send(vsifname(outfname));
-    }
+        else {
+            // Pass the "RAW" parameter to output raw image
+            if (cgi("RAW").empty()) {
+                os << "Status: 200 OK\r\n";
+                os << "Content-type: image/jpeg\r\n";
+                os << "\r\n";
+                c.send(os.str());
+            }
+            c.send(vsifname(outfname));
+        }
 
-    VSIUnlink(outfname);
-    // This is not strictly required, it will keep getting overwritten
-    VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+        VSIUnlink(outfname);
+        // This is not strictly required, it will keep getting overwritten
+        VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+    } else if (!c.dynconf.prefix.empty()) {
+        auto fname = cgi("ID");
+        if (fname.empty())
+            return ret_error(c, "Missing ID element", 400);
+        fname = c.dynconf.prefix + fname + c.dynconf.suffix;
+        if (!c.dataset.open(fname))
+            return ret_error(c, "No such dataset");            
+        // Now it's open 
+        // Like vargs
+        char **targs = nullptr;
+        targs = CSLAddString(targs, "-of");
+        targs = CSLAddString(targs, "JPEG");
+        targs = CSLAddString(targs, "-outsize");
+        targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+        targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+        targs = CSLAddString(targs, "-srcwin");
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2] - bbox[0]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3] - bbox[1]));
+        targs = CSLAddString(targs, "0");
+
+        auto topt = GDALTranslateOptionsNew(targs, nullptr );
+        CPLFree(targs);
+        int errv;
+        const char outfname[] = "/vsimem/out.jpg";
+        auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
+        GDALClose(ods); // Force flush
+        GDALTranslateOptionsFree(topt);
+
+        if (c.verbose) {
+            c.send(os.str());
+        }
+        else {
+            // Pass the "RAW" parameter to output raw image
+            if (cgi("RAW").empty()) {
+                os << "Status: 200 OK\r\n";
+                os << "Content-type: image/jpeg\r\n";
+                os << "\r\n";
+                c.send(os.str());
+            }
+            c.send(vsifname(outfname));
+        }
+
+        VSIUnlink(outfname);
+        // This is not strictly required, it will keep getting overwritten
+        VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+    } else { // Uknown configuration
+        return ret_error(c, "Configuration failure", 500);
+    }
     return 0;
 }
 
@@ -294,7 +376,7 @@ int html_out(State &state, const string & extra) {
 
     // Set up the page's header and title.
     os << head() << endl;
-    os << title() << "GNU cgicc v" << cgi.getVersion() << title() << endl;
+    os << title() << "GIS GDAL Image Subsetter" << title() << endl;
     os << head() << endl;
 
     // Start the HTML body
@@ -351,7 +433,7 @@ int realmain(int argc, char **argv, char **env) {
         state.cgi = &cgi;
         state.verbose = !cgi("dbg").empty();
         if (state.verbose)
-            html_out(state, CPLOPrintf("%x %s", state.pds, CPLGetLastErrorMsg() ));
+            html_out(state, CPLOPrintf("%s %x %s", state.dataset.name.c_str(), state.dataset.pds, CPLGetLastErrorMsg() ));
         else
             get_image(state);
         if (is_fcgi)
