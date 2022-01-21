@@ -16,3 +16,8 @@ install: $(TARGET)
 
 clean:
 	$(RM) $(TARGET)
+
+test: $(TARGET)
+	rm -f out.*
+	QUERY_STRING="What&size=1024,1024&RAW=1" ./$(TARGET) >out.jpg
+	gdalinfo -hist out.jpg

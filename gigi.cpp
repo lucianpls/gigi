@@ -31,11 +31,26 @@ struct vsifname {
     CPLString name;
 };
 
+struct Dynconf {
+    string prefix;
+    string suffix;
+};
+
 // CGIInput adapter class, for use with libfcgi
 // need to define read() and getenv() to keep libcgicc happy
-class state : public CgiInput {
+class State : public CgiInput {
 public:
-    state(FCGX_Request *request) : verbose(false), req(request) {}
+    State(FCGX_Request *request = nullptr) : verbose(false), req(request) {}
+
+    ~State() {
+        // Prefered over delete
+        if (pds)
+            GDALClose(GDALDataset::ToHandle(pds));
+        if (conf)
+            CSLDestroy(conf);
+    }
+
+    bool configure(char **config = nullptr);
 
     size_t read(char *data, size_t len) override {
         if (!req) return 0;
@@ -87,7 +102,27 @@ public:
     char **conf;
     // GDAL pre-open dataset
     GDALDataset *pds;
+    Dynconf dynconf;
 };
+
+// Maybe this should be a JSON file?
+bool State::configure(char **config) {
+    conf = config;
+    string fname = CSLFetchNameValueDef(conf, "Filename", "");
+    if (!fname.empty()) {
+        // The input dataset, any error gets set to stderr
+        pds = GDALDataset::Open(fname.c_str(), GA_ReadOnly);
+        if (!pds) {
+            cerr << "Can't open file named \"" << (*cgi)("Filename") << '"' << endl;
+            return false; // Failure to open
+        }
+    } else { // Assume dynamic
+        dynconf.prefix = CSLFetchNameValueDef(conf, "DPrefix", "");
+        dynconf.suffix = CSLFetchNameValueDef(conf, "DSuffix", "");
+    }
+
+    return false;
+}
 
 // int usage(int argc, char **argv) {
 //     fprintf(stderr, "Usage: %s\n [options] filename", argv[0]);
@@ -99,8 +134,8 @@ const unordered_map<int, const char *> html_errors = {
     { 404 , "Not Found"},
 };
 
-int ret_error(state &c, const string &message, int code = 404) {
-    ostringstream os;    
+static int ret_error(State &c, const string &message, int code = 404) {
+    ostringstream os;
 
     // With cgicc, only the Status line can be sent, which means no other headers work is raw text
     // os << HTTPStatusHeader(code, message);
@@ -120,7 +155,7 @@ int ret_error(state &c, const string &message, int code = 404) {
     return 0;
 }
 
-int get_missing(state &c) {
+int get_missing(State &c) {
     auto conf = c.conf;
     auto request = c.req;
     auto &cgi = *c.cgi;
@@ -164,7 +199,7 @@ int parse_bbox(const char *bbval, double *bbox) {
     return i;
 }
 
-int get_image(state &c) {
+int get_image(State &c) {
     ostringstream os;    
     auto conf = c.conf;
     auto request = c.req;
@@ -230,10 +265,14 @@ int get_image(state &c) {
         c.send(os.str());
     }
     else {
-        os << "Status: 200 OK\r\n";
-        os << "Content-type: image/jpeg\r\n";
-        os << "\r\n";
-        c.send(os.str());
+        // Pass the "RAW" parameter to output raw image
+        if (cgi("RAW").empty()) {
+            fprintf(stderr,"Header\n");
+            os << "Status: 200 OK\r\n";
+            os << "Content-type: image/jpeg\r\n";
+            os << "\r\n";
+            c.send(os.str());
+        }
         c.send(vsifname(outfname));
     }
 
@@ -243,9 +282,9 @@ int get_image(state &c) {
     return 0;
 }
 
-int html_out(state &c, const string & extra) {
-    auto request = c.req;
-    auto &cgi = *c.cgi;
+int html_out(State &state, const string & extra) {
+    auto request = state.req;
+    auto &cgi = *state.cgi;
     // output string, as stream
     ostringstream os;
 
@@ -278,8 +317,6 @@ int html_out(state &c, const string & extra) {
     for (auto &i: *cgi)
         os << i.getName() << "=" << i.getValue() << br() << endl;
 
-    vector<FormEntry> res;
-    os << br() << "Value of a is " << cgi.getElement("dbg", res) << br() << endl;
     // Or direct, by name
     if (cgi("bbox").empty())
         os << "Can't find bbox" << br() << endl;
@@ -289,54 +326,43 @@ int html_out(state &c, const string & extra) {
     if (!extra.empty())
         os << "Extra " << extra << br() << endl;
 
-    c.send(os.str());
+    state.send(os.str());
 
     return 0;
 }
 
-int main(int argc, char **argv, char **env) {
-    string confname(argv[0]);
-    confname += ".config";
-    auto conf = CSLLoad(confname.c_str());
-
-    string fname = CSLFetchNameValueDef(conf, "FileName", "");
-    GDALAllRegister();
-    
-    // The input dataset, any error gets set to stderr
-    auto pds = GDALDataset::Open(fname.c_str(), GA_ReadOnly);
-    // if (!pds) {
-    //     cerr << "Can't open file named \"" << fname << '"' << endl;
-    //     return 1; // Failure to open
-    // }
-
+int realmain(int argc, char **argv, char **env) {
+    State state(nullptr);
+    if (!state.configure(CSLLoad((string(argv[0]) + ".config").c_str()))) {
+        GDALDestroy();
+        return 1;
+    }
     FCGX_Init();
     FCGX_Request request;
     FCGX_InitRequest(&request, 0, 0);
 
     auto is_fcgi = (FCGX_Accept_r(&request) >= 0);
     // Gets executed only once in CGI mode
-    state c(is_fcgi ? &request : nullptr);
-    c.conf = conf;
-    c.pds = pds;
-    do {
-        // Per request
-        Cgicc cgi(is_fcgi ? &c : nullptr);
-        c.cgi = &cgi;
+    if (is_fcgi)
+        state.req = &request;
 
-        vector<FormEntry> res;
-        c.verbose = cgi.getElement("dbg", res);
-        // if (c.verbose)
-        //     html_out(c, CPLOPrintf("%x %s", pds, CPLGetLastErrorMsg() ));
-        // else
-        get_image(c);
+    do { // Per request
+        Cgicc cgi(is_fcgi ? & state : nullptr);
+        state.cgi = &cgi;
+        state.verbose = !cgi("dbg").empty();
+        if (state.verbose)
+            html_out(state, CPLOPrintf("%x %s", state.pds, CPLGetLastErrorMsg() ));
+        else
+            get_image(state);
         if (is_fcgi)
             FCGX_Finish_r(&request);
-
     } while (is_fcgi && FCGX_Accept_r(&request) == 0);
+}
 
-    // Prefered over delete
-    GDALClose(GDALDataset::ToHandle(pds));
-    CPLFree(conf);
+int main(int argc, char **argv, char **env) {
+    // All automatic GDAL structures have to be gone before calling Destroy()
+    GDALAllRegister();
+    realmain(argc, argv, env);
     GDALDestroy();
-   return 0;
+    return 0;
 }
