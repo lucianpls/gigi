@@ -203,7 +203,7 @@ int get_missing(State &c) {
     vector<unsigned char> buffer(sz);
     fread(buffer.data(), sz, 1, missing);
 
-    ostringstream os;    
+    ostringstream os;
     os << "Status: 200 OK\r\n";
     os << "Content-type: image/jpeg\r\n";
     os << "\r\n";
@@ -215,20 +215,21 @@ int get_missing(State &c) {
 
 int parse_bbox(const char *bbval, double *bbox) {
     int i = 0;
-    char *bb;
     errno = 0;
-    *bbox++ = CPLStrtod(bbval, &bb);
-    if (errno)
-        return 0;
-    i++;
+    auto bb = const_cast<char *>(bbval);
     do {
         if (*bb == ',') bb++;
-        *bbox++ = CPLStrtod(bb, &bb);
+        bbox[i] = CPLStrtod(bb, &bb);
         if (errno)
             return i;
         i++;
-    } while (i < 4 && *bbval);
-    return i;
+    } while (i < 4 && * bb);
+    if (i < 3)
+        return i;
+    // Check the basic bbox order
+    if (bbox[2] <= bbox[0] || bbox[3] <= bbox[1])
+        return bbox[2] <= bbox[0];
+    return 4;
 }
 
 int get_image(State &c) {
@@ -257,11 +258,11 @@ int get_image(State &c) {
     if (xsz > 2048 || ysz > 2048)
         xsz = ysz = 1024;
 
+    // Assume EPSG:4326
     double bbox[4] = { -180, -90, 180, 90 };
     if (!cgi("bbox").empty())
         if (4 != parse_bbox(cgi("bbox").c_str(), bbox))
             return ret_error(c, "Can't parse bbox");
-    
     if (c.verbose) {
         os << "Bounding Box" <<
          bbox[0] << "," <<
@@ -286,7 +287,7 @@ int get_image(State &c) {
         targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
         targs = CSLAddString(targs, "0");
 
-        auto topt = GDALTranslateOptionsNew(targs, nullptr );
+        auto topt = GDALTranslateOptionsNew(targs, nullptr);
         CPLFree(targs);
         int errv;
         const char outfname[] = "/vsimem/out.jpg";
@@ -317,8 +318,23 @@ int get_image(State &c) {
             return ret_error(c, "Missing ID element", 400);
         fname = c.dynconf.prefix + fname + c.dynconf.suffix;
         if (!c.dataset.open(fname))
-            return ret_error(c, "No such dataset");            
-        // Now it's open 
+            return ret_error(c, "No such dataset");
+        // Now it's open, check the bbox
+        auto ds = c.dataset.pds;
+        auto xsize = ds->GetRasterXSize();
+        auto ysize = ds->GetRasterYSize();
+        // Replace the default for bbox
+        if (bbox[0] == -180 && bbox[1] == 180) {
+            bbox[0] = 0;
+            bbox[1] = 0;
+            bbox[2] = xsize;
+            bbox[3] = ysize;
+        }
+        for (int i=0; i < 4; i++)
+            bbox[i] = static_cast<int>(bbox[i]);
+        if (bbox[0] < 0 || bbox[1] < 0 || bbox[2] > xsize || bbox[3] > ysize)
+            return ret_error(c, "Malformed bbox", 400);
+
         // Like vargs
         char **targs = nullptr;
         targs = CSLAddString(targs, "-of");
@@ -328,7 +344,7 @@ int get_image(State &c) {
         targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
         targs = CSLAddString(targs, "-srcwin");
         targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
+        targs = CSLAddString(targs, CPLSPrintf("%f", ysize - bbox[3]));
         targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2] - bbox[0]));
         targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3] - bbox[1]));
         targs = CSLAddString(targs, "0");
@@ -402,6 +418,9 @@ int html_out(State &state, const string & extra) {
     // Or direct, by name
     if (cgi("bbox").empty())
         os << "Can't find bbox" << br() << endl;
+    double bb[4];
+    auto vals = parse_bbox(cgi("bbox").c_str(), bb);
+    os << "Value " << vals <<  " x " << bb[0] << " y " << bb[1] << " X " << bb[2] << " Y " << bb[3] << endl;
 
     // Close the document
     os << body() << html();
