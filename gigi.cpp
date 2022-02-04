@@ -10,17 +10,24 @@
 #include <string>
 #include <sstream>
 #include <unordered_map>
-#include <fcgiapp.h>
-#include <cgicc/Cgicc.h>
 
+#include <fcgiapp.h>
+
+#include <cgicc/Cgicc.h>
 // Things like head(), body(), br(), streamable out
 #include <cgicc/HTMLClasses.h>
 #include <cgicc/HTTPHTMLHeader.h>
 #include <cgicc/HTTPResponseHeader.h>
 #include <cgicc/HTTPStatusHeader.h>
 
+// gdal_priv is a bad name, it contains the C++ API
 #include <gdal_priv.h>
 #include <gdal_utils.h>
+
+#include <lua.hpp>
+
+// Functions in lua script
+#define LQUERY_HANDLER "query_handler"
 
 using namespace std;
 using namespace cgicc;
@@ -38,14 +45,12 @@ struct Dynconf {
 
 // A GDAL dataset, preopened if pds is not nullptr
 struct gdataset {
-    gdataset() : pds(nullptr), type(0) {};
+    gdataset() : pds(nullptr) {};
     bool open(const string &fname) {
-        if (fname == name) {
-            cerr << "Same file\n";
+        if (fname == dsetname)
             return pds != nullptr;
-        }
         clear();
-        name = fname;
+        dsetname = fname;
         pds = GDALDataset::Open(fname.c_str(), GA_ReadOnly);
         return pds != nullptr;
     }
@@ -55,28 +60,34 @@ struct gdataset {
             // Prefered over delete
             GDALClose(GDALDataset::ToHandle(pds));
             pds = nullptr;
-            name.clear();
+            dsetname.clear();
         }
     }
 
     GDALDataset *pds;
-    string name;
-    int type;
+    string dsetname;
 };
+
+// Type of configuration, can be single dataset, ID param or lua script
+typedef enum{CONF_SINGLE, CONF_ID, CONF_LUA} conft;
 
 // CGIInput adapter class, for use with libfcgi
 // need to define read() and getenv() to keep libcgicc happy
 class State : public CgiInput {
 public:
-    State(FCGX_Request *request = nullptr) : verbose(false), req(request) {}
+    State(FCGX_Request *request = nullptr) : verbose(false), req(request), L(nullptr), conf(nullptr), type(CONF_SINGLE) {}
 
     ~State() {
         dataset.clear();
+        if (L) {
+           lua_close(L);
+            L = nullptr;
+        };
         if (conf)
             CSLDestroy(conf);
     }
 
-    bool configure(char **config = nullptr);
+    bool configure(char *basename = nullptr);
 
     size_t read(char *data, size_t len) override {
         if (!req) return 0;
@@ -126,30 +137,66 @@ public:
     Cgicc *cgi;
     // Input configuration file, line by line
     char **conf;
+    conft type;
     // GDAL pre-open dataset
     gdataset dataset;
     // string prefix and suffix if ID is expected
     Dynconf dynconf;
+    lua_State *L;
 };
 
-// Maybe this should be a JSON file?
-bool State::configure(char **config) {
-    conf = config;
+
+// Checks that the loaded script meets expectations, called during configuration
+bool check_lua(lua_State *L) {
+    if (!L) return false;
+    lua_getglobal(L, LQUERY_HANDLER);
+    auto found = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+    return found;
+}
+
+bool State::configure(char *basename) {
+    FILE *conff = fopen((string(basename) + ".config").c_str(), "rb");
+    if (!conff) { // Try lua
+        L = luaL_newstate();
+        if (!L) {
+            cerr << "Can't start lua\n";
+            return false;
+        }
+        luaL_openlibs(L);
+        // Load and initialize the lua script
+        if (luaL_dofile(L, (string(basename) + ".lua").c_str())) {
+            cerr << "Can't read " << string(basename) + ".lua" << " as a lua script" << endl;
+            return false;
+        }
+
+        if (!check_lua(L)) {
+            cerr << "Invalid lua script\n";
+            return false;
+        }
+        type = CONF_LUA;
+        return true;
+    }
+    fclose(conff);
+    conf = CSLLoad((string(basename) + ".config").c_str());
+    if (!conf)
+        return false;
     if (strlen(CSLFetchNameValueDef(conf, "Filename", ""))) {
         // The input dataset, any error gets set to stderr
         if (!dataset.open(CSLFetchNameValueDef(conf, "Filename", ""))) {
-            cerr << "Can't open file named \"" << dataset.name << '"' << endl;
+            cerr << "Can't open file named \"" << dataset.dsetname << '"' << endl;
             return false; // Failure to open
         }
+        type = CONF_SINGLE;
         return true;
     } else { // Assume dynamic
-        dataset.type = 1;
-        dynconf.prefix = CSLFetchNameValueDef(conf, "DPrefix", "");
+        type = CONF_ID;
+        dynconf.prefix = CSLFetchNameValueDef(conf, "ls -lat ", "");
         dynconf.suffix = CSLFetchNameValueDef(conf, "DSuffix", "");
         return true;
     }
 
-    return false;
+    return false; // Error
 }
 
 // int usage(int argc, char **argv) {
@@ -272,110 +319,204 @@ int get_image(State &c) {
          br() << "\r\n";
     }
 
-    if (!c.dataset.type) {
-        // Like vargs
-        char **targs = nullptr;
-        targs = CSLAddString(targs, "-of");
-        targs = CSLAddString(targs, "JPEG");
-        targs = CSLAddString(targs, "-outsize");
-        targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
-        targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
-        targs = CSLAddString(targs, "-projwin");
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
-        targs = CSLAddString(targs, "0");
+    switch (c.type) {
+        case CONF_SINGLE: { // Single file, WMS bbox
+            if (nullptr == c.dataset.pds) {
+                cerr << "Single dataset not open\n";
+                return ret_error(c, "dataset failure", 500);
+            }
+            // Like vargs
+            char **targs = nullptr;
+            targs = CSLAddString(targs, "-of");
+            targs = CSLAddString(targs, "JPEG");
+            targs = CSLAddString(targs, "-outsize");
+            targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+            targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+            targs = CSLAddString(targs, "-projwin");
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[1]));
+            targs = CSLAddString(targs, "0");
 
-        auto topt = GDALTranslateOptionsNew(targs, nullptr);
-        CPLFree(targs);
-        int errv;
-        const char outfname[] = "/vsimem/out.jpg";
-        auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
-        GDALClose(ods); // Force flush
-        GDALTranslateOptionsFree(topt);
+            auto topt = GDALTranslateOptionsNew(targs, nullptr);
+            CPLFree(targs);
+            int errv;
+            const char outfname[] = "/vsimem/out.jpg";
+            auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
+            GDALClose(ods); // Force flush
+            GDALTranslateOptionsFree(topt);
 
-        if (c.verbose) {
-            c.send(os.str());
-        }
-        else {
-            // Pass the "RAW" parameter to output raw image
-            if (cgi("RAW").empty()) {
-                os << "Status: 200 OK\r\n";
-                os << "Content-type: image/jpeg\r\n";
-                os << "\r\n";
+            if (c.verbose) {
                 c.send(os.str());
             }
-            c.send(vsifname(outfname));
+            else {
+                // Pass the "RAW" parameter to output raw image
+                if (cgi("RAW").empty()) {
+                    os << "Status: 200 OK\r\n";
+                    os << "Content-type: image/jpeg\r\n";
+                    os << "\r\n";
+                    c.send(os.str());
+                }
+                c.send(vsifname(outfname));
+            }
+
+            VSIUnlink(outfname);
+            // This is not strictly required, it will keep getting overwritten
+            VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+            break;
         }
+        case CONF_ID: { // Dynamic conf
+            auto fname = cgi("ID");
+            if (fname.empty())
+                return ret_error(c, "Missing ID element", 400);
+            fname = c.dynconf.prefix + fname + c.dynconf.suffix;
+            if (!c.dataset.open(fname))
+                return ret_error(c, "No such dataset");
+            // Now it's open, check the bbox
+            auto ds = c.dataset.pds;
+            auto xsize = ds->GetRasterXSize();
+            auto ysize = ds->GetRasterYSize();
+            // Replace the default for bbox
+            if (bbox[0] == -180 && bbox[1] == 180) {
+                bbox[0] = 0;
+                bbox[1] = 0;
+                bbox[2] = xsize;
+                bbox[3] = ysize;
+            }
+            for (int i=0; i < 4; i++)
+                bbox[i] = static_cast<int>(bbox[i]);
+            if (bbox[0] < 0 || bbox[1] < 0 || bbox[2] > xsize || bbox[3] > ysize)
+                return ret_error(c, "Bad bbox values", 400);
 
-        VSIUnlink(outfname);
-        // This is not strictly required, it will keep getting overwritten
-        VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
-    } else if (!c.dynconf.prefix.empty()) {
-        auto fname = cgi("ID");
-        if (fname.empty())
-            return ret_error(c, "Missing ID element", 400);
-        fname = c.dynconf.prefix + fname + c.dynconf.suffix;
-        if (!c.dataset.open(fname))
-            return ret_error(c, "No such dataset");
-        // Now it's open, check the bbox
-        auto ds = c.dataset.pds;
-        auto xsize = ds->GetRasterXSize();
-        auto ysize = ds->GetRasterYSize();
-        // Replace the default for bbox
-        if (bbox[0] == -180 && bbox[1] == 180) {
-            bbox[0] = 0;
-            bbox[1] = 0;
-            bbox[2] = xsize;
-            bbox[3] = ysize;
-        }
-        for (int i=0; i < 4; i++)
-            bbox[i] = static_cast<int>(bbox[i]);
-        if (bbox[0] < 0 || bbox[1] < 0 || bbox[2] > xsize || bbox[3] > ysize)
-            return ret_error(c, "Malformed bbox", 400);
+            // Like vargs
+            char **targs = nullptr;
+            targs = CSLAddString(targs, "-of");
+            targs = CSLAddString(targs, "JPEG");
+            targs = CSLAddString(targs, "-outsize");
+            targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+            targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+            targs = CSLAddString(targs, "-srcwin");
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", ysize - bbox[3]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2] - bbox[0]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3] - bbox[1]));
+            targs = CSLAddString(targs, "0");
 
-        // Like vargs
-        char **targs = nullptr;
-        targs = CSLAddString(targs, "-of");
-        targs = CSLAddString(targs, "JPEG");
-        targs = CSLAddString(targs, "-outsize");
-        targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
-        targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
-        targs = CSLAddString(targs, "-srcwin");
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", ysize - bbox[3]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2] - bbox[0]));
-        targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3] - bbox[1]));
-        targs = CSLAddString(targs, "0");
+            auto topt = GDALTranslateOptionsNew(targs, nullptr );
+            CPLFree(targs);
+            int errv;
+            const char outfname[] = "/vsimem/out.jpg";
+            auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
+            GDALClose(ods); // Force flush
+            GDALTranslateOptionsFree(topt);
 
-        auto topt = GDALTranslateOptionsNew(targs, nullptr );
-        CPLFree(targs);
-        int errv;
-        const char outfname[] = "/vsimem/out.jpg";
-        auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
-        GDALClose(ods); // Force flush
-        GDALTranslateOptionsFree(topt);
-
-        if (c.verbose) {
-            c.send(os.str());
-        }
-        else {
-            // Pass the "RAW" parameter to output raw image
-            if (cgi("RAW").empty()) {
-                os << "Status: 200 OK\r\n";
-                os << "Content-type: image/jpeg\r\n";
-                os << "\r\n";
+            if (c.verbose) {
                 c.send(os.str());
             }
-            c.send(vsifname(outfname));
-        }
+            else {
+                // Pass the "RAW" parameter to output raw image
+                if (cgi("RAW").empty()) {
+                    os << "Status: 200 OK\r\n";
+                    os << "Content-type: image/jpeg\r\n";
+                    os << "\r\n";
+                    c.send(os.str());
+                }
+                c.send(vsifname(outfname));
+            }
 
-        VSIUnlink(outfname);
-        // This is not strictly required, it will keep getting overwritten
-        VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
-    } else { // Uknown configuration
-        return ret_error(c, "Configuration failure", 500);
+            VSIUnlink(outfname);
+            // This is not strictly required, it will keep getting overwritten
+            VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+            break;
+        }
+        case CONF_LUA: {
+            if (!c.L)
+                return ret_error(c, "Configuration failure", 500);
+            lua_getglobal(c.L, LQUERY_HANDLER);
+            // Check, should never happen
+            if (!lua_isfunction(c.L, -1)) {
+                lua_pop(c.L, 1);
+                return ret_error(c, "Missing query handler", 500);
+            }
+
+            lua_pushstring(c.L, cgi.getEnvironment().getQueryString().c_str());
+            auto err = lua_pcall(c.L, 1, 1, 0);
+            if (err) {
+                // TODO: Might leave the stack dirty?
+                return ret_error(c, "Raster lookup failure", 500);
+            }
+            if (!lua_isstring(c.L, -1)) {
+                lua_pop(c.L, 1);
+                return ret_error(c, "Invalid raster request", 404);
+            }
+            string rastername(lua_tostring(c.L, -1));
+            lua_pop(c.L, 1);
+            if (!c.dataset.open(rastername))
+                return ret_error(c, "No such dataset");
+
+            // From here on, it's the same code as for the dynamic conf
+            // Now it's open, check the bbox
+            auto ds = c.dataset.pds;
+            auto xsize = ds->GetRasterXSize();
+            auto ysize = ds->GetRasterYSize();
+            // Replace the default for bbox
+            if (bbox[0] == -180 && bbox[1] == 180) {
+                bbox[0] = 0;
+                bbox[1] = 0;
+                bbox[2] = xsize;
+                bbox[3] = ysize;
+            }
+            for (int i=0; i < 4; i++)
+                bbox[i] = static_cast<int>(bbox[i]);
+            if (bbox[0] < 0 || bbox[1] < 0 || bbox[2] > xsize || bbox[3] > ysize)
+                return ret_error(c, "Bad bbox values", 400);
+
+            // Like vargs
+            char **targs = nullptr;
+            targs = CSLAddString(targs, "-of");
+            targs = CSLAddString(targs, "JPEG");
+            targs = CSLAddString(targs, "-outsize");
+            targs = CSLAddString(targs, CPLOPrintf("%u", xsz));
+            targs = CSLAddString(targs, CPLOPrintf("%u", ysz));
+            targs = CSLAddString(targs, "-srcwin");
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[0]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", ysize - bbox[3]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[2] - bbox[0]));
+            targs = CSLAddString(targs, CPLSPrintf("%f", bbox[3] - bbox[1]));
+            targs = CSLAddString(targs, "0");
+
+            auto topt = GDALTranslateOptionsNew(targs, nullptr );
+            CPLFree(targs);
+            int errv;
+            const char outfname[] = "/vsimem/out.jpg";
+            CPLPushErrorHandler(CPLQuietErrorHandler);
+            auto ods = GDALTranslate(outfname, c.dataset.pds, topt, &errv);
+            CPLPopErrorHandler();
+            GDALClose(ods); // Force flush
+            GDALTranslateOptionsFree(topt);
+
+            if (c.verbose) {
+                c.send(os.str());
+            }
+            else {
+                // Pass the "RAW" parameter to output raw image
+                if (cgi("RAW").empty()) {
+                    os << "Status: 200 OK\r\n";
+                    os << "Content-type: image/jpeg\r\n";
+                    os << "\r\n";
+                    c.send(os.str());
+                }
+                c.send(vsifname(outfname));
+            }
+
+            VSIUnlink(outfname);
+            // This is not strictly required, it will keep getting overwritten
+            VSIUnlink(CPLOPrintf("%s%s", outfname, ".aux.xml"));
+            break;
+        }
+        default:
+            return ret_error(c, "Configuration failure", 500);
     }
     return 0;
 }
@@ -432,12 +573,10 @@ int html_out(State &state, const string & extra) {
     return 0;
 }
 
-int realmain(int argc, char **argv, char **env) {
+int mainloop(int argc, char **argv, char **env) {
     State state(nullptr);
-    if (!state.configure(CSLLoad((string(argv[0]) + ".config").c_str()))) {
-        GDALDestroy();
+    if (!state.configure(argv[0]))
         return 1;
-    }
     FCGX_Init();
     FCGX_Request request;
     FCGX_InitRequest(&request, 0, 0);
@@ -452,7 +591,7 @@ int realmain(int argc, char **argv, char **env) {
         state.cgi = &cgi;
         state.verbose = !cgi("dbg").empty();
         if (state.verbose)
-            html_out(state, CPLOPrintf("%s %x %s", state.dataset.name.c_str(), state.dataset.pds, CPLGetLastErrorMsg() ));
+            html_out(state, CPLOPrintf("%s %x %s", state.dataset.dsetname.c_str(), state.dataset.pds, CPLGetLastErrorMsg() ));
         else
             get_image(state);
         if (is_fcgi)
@@ -463,7 +602,7 @@ int realmain(int argc, char **argv, char **env) {
 int main(int argc, char **argv, char **env) {
     // All automatic GDAL structures have to be gone before calling Destroy()
     GDALAllRegister();
-    realmain(argc, argv, env);
+    mainloop(argc, argv, env);
     GDALDestroy();
     return 0;
 }
