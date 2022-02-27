@@ -11,9 +11,9 @@ $(TARGET): $(INPUTS) $(HEADERS)
 
 install: $(TARGET)
 	sudo service httpd stop
-	cp gigi.config /var/www/cgi-bin
-	cp wi.wms /var/www/cgi-bin
-	cp $^ /var/www/cgi-bin
+	sudo cp gigi.config /var/www/cgi-bin
+	sudo cp wi.wms /var/www/cgi-bin
+	sudo cp $^ /var/www/cgi-bin
 	sudo service httpd start
 
 clean:
