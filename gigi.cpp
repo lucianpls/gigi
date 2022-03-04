@@ -191,7 +191,7 @@ bool State::configure(char *basename) {
         return true;
     } else { // Assume dynamic
         type = CONF_ID;
-        dynconf.prefix = CSLFetchNameValueDef(conf, "ls -lat ", "");
+        dynconf.prefix = CSLFetchNameValueDef(conf, "DPrefix", "");
         dynconf.suffix = CSLFetchNameValueDef(conf, "DSuffix", "");
         return true;
     }
